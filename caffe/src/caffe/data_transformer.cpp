@@ -1,5 +1,7 @@
 #ifdef USE_OPENCV
+#include <opencv2/opencv.hpp>
 #include <opencv2/core/core.hpp>
+#include <opencv2/imgproc/imgproc.hpp>
 #endif  // USE_OPENCV
 
 #include <string>
@@ -36,6 +38,12 @@ DataTransformer<Dtype>::DataTransformer(const TransformationParameter& param,
       mean_values_.push_back(param_.mean_value(c));
     }
   }
+  // check if we want to do random scaling
+  if (param_.scale_factors_size() > 0) {
+    for (int i = 0; i < param_.scale_factors_size(); ++i) {
+      scale_factors_.push_back(param_.scale_factors(i));
+    }
+  }  
 }
 
 template<typename Dtype>
@@ -435,6 +443,295 @@ void DataTransformer<Dtype>::Transform(Blob<Dtype>* input_blob,
   if (scale != Dtype(1)) {
     DLOG(INFO) << "Scale: " << scale;
     caffe_scal(size, scale, transformed_data);
+  }
+}
+
+template<typename Dtype>
+void DataTransformer<Dtype>::TransformImgAndSeg(
+    const std::vector<cv::Mat>& cv_img_seg,
+    Blob<Dtype>* transformed_data_blob,
+    Blob<Dtype>* transformed_label_blob,
+    const int ignore_label) {
+  CHECK(cv_img_seg.size() >= 2) << "Input must contain at least image and seg.";
+
+  const int img_channels = cv_img_seg[0].channels();
+  // height and width may change due to pad for cropping
+  int img_height   = cv_img_seg[0].rows;
+  int img_width    = cv_img_seg[0].cols;
+
+  const int seg_channels = cv_img_seg[1].channels();
+  int seg_height   = cv_img_seg[1].rows;
+  int seg_width    = cv_img_seg[1].cols;
+
+  const int data_channels = transformed_data_blob->channels();
+  const int data_height   = transformed_data_blob->height();
+  const int data_width    = transformed_data_blob->width();
+
+  const int label_channels = transformed_label_blob->channels();
+  const int label_height   = transformed_label_blob->height();
+  const int label_width    = transformed_label_blob->width();
+
+  const int num_edge_chn = cv_img_seg.size()>2 ? cv_img_seg.size()-2 : 0;
+
+  // Sanity checks for CASENet
+  CHECK_EQ(data_channels, img_channels + num_edge_chn);
+  CHECK_EQ(label_channels, seg_channels);
+
+  CHECK_EQ(img_height, seg_height);
+  CHECK_EQ(data_height, label_height);
+
+  CHECK_EQ(img_width, seg_width);
+  CHECK_EQ(data_width, label_width);
+
+  CHECK(cv_img_seg[0].depth() == CV_8U)
+      << "Image data type must be unsigned byte";
+  CHECK(cv_img_seg[1].depth() == CV_8U || cv_img_seg[1].depth() == CV_32F)
+      << "Seg data type must be unsigned byte or float";//for CASENet
+
+  //const int crop_size = param_.crop_size();
+  int crop_width = 0;
+  int crop_height = 0;
+  CHECK((!param_.has_crop_size() && param_.has_crop_height() && param_.has_crop_width())
+    || (!param_.has_crop_height() && !param_.has_crop_width()))
+    << "Must either specify crop_size or both crop_height and crop_width.";
+  if (param_.has_crop_size()) {
+    crop_width = param_.crop_size();
+    crop_height = param_.crop_size();
+  }
+  if (param_.has_crop_height() && param_.has_crop_width()) {
+    crop_width = param_.crop_width();
+    crop_height = param_.crop_height();
+  }
+
+  const Dtype scale = param_.scale();
+  const bool do_mirror = param_.mirror() && Rand(2);
+  const bool has_mean_file = param_.has_mean_file();
+  const bool has_mean_values = mean_values_.size() > 0;
+
+  CHECK_GT(img_channels, 0);
+
+  Dtype* mean = NULL;
+  if (has_mean_file) {
+    CHECK_EQ(img_channels, data_mean_.channels());
+    CHECK_EQ(img_height, data_mean_.height());
+    CHECK_EQ(img_width, data_mean_.width());
+    mean = data_mean_.mutable_cpu_data();
+  }
+  if (has_mean_values) {
+    CHECK(mean_values_.size() == 1 || mean_values_.size() == img_channels) <<
+     "Specify either 1 mean_value or as many as channels: " << img_channels;
+    if (img_channels > 1 && mean_values_.size() == 1) {
+      // Replicate the mean_value for simplicity
+      for (int c = 1; c < img_channels; ++c) {
+        mean_values_.push_back(mean_values_[0]);
+      }
+    }
+  }
+
+  // start to perform transformation
+  cv::Mat cv_cropped_img;
+  cv::Mat cv_cropped_seg;
+  std::vector<cv::Mat> cv_cropped_edges( num_edge_chn );
+
+  // perform scaling
+  if (scale_factors_.size() > 0) {
+    Dtype scale;
+    if (phase_ == TRAIN) {
+      int scale_ind = Rand(scale_factors_.size());
+      scale   = scale_factors_[scale_ind];
+    } else {
+      // Always use the first indicated scale in testing
+      scale   = scale_factors_[0]; //for CASENet
+    }
+
+    if (scale != 1) {
+      img_height *= scale;
+      img_width  *= scale;
+      cv::resize(cv_img_seg[0], cv_cropped_img, cv::Size(img_width, img_height), 0, 0,
+       cv::INTER_LINEAR);
+      cv::resize(cv_img_seg[1], cv_cropped_seg, cv::Size(img_width, img_height), 0, 0,
+       cv::INTER_NEAREST);
+      //resize edge maps, if any
+      for(int ith=0; ith<num_edge_chn; ++ith) {
+        cv::resize(cv_img_seg[ith+2], cv_cropped_edges[ith], cv::Size(img_width, img_height), 0, 0,
+          cv::INTER_LINEAR);
+      }
+    } else {
+      cv_cropped_img = cv_img_seg[0];
+      cv_cropped_seg = cv_img_seg[1];
+      //reference edge maps, if any
+      for(int ith=0; ith<num_edge_chn; ++ith) {
+        cv_cropped_edges[ith] = cv_img_seg[ith+2];
+      }
+    }
+  } else {
+    cv_cropped_img = cv_img_seg[0];
+    cv_cropped_seg = cv_img_seg[1];
+    //reference edge maps, if any
+    for(int ith=0; ith<num_edge_chn; ++ith) {
+      cv_cropped_edges[ith] = cv_img_seg[ith+2];
+    }
+  }
+
+  int h_off = 0;
+  int w_off = 0;
+
+  // transform to double, since we will pad mean pixel values
+  cv_cropped_img.convertTo(cv_cropped_img, CV_64F);
+  // transform edge maps to float, if any. Note that cv_cropped_edges is still in [0, 255] now
+  for(int ith=0; ith<num_edge_chn; ++ith) {
+    cv_cropped_edges[ith].convertTo(cv_cropped_edges[ith], CV_32F);
+  }
+
+  // Check label type
+  const bool is_label_ml = (cv_cropped_seg.depth() == cv::DataType<float>::depth);//for CASENet
+
+  // Check if we need to pad img to fit for crop_size
+  // copymakeborder
+  int pad_height = std::max(crop_height - img_height, 0);
+  int pad_width  = std::max(crop_width - img_width, 0);
+  if (pad_height > 0 || pad_width > 0) {
+    cv::copyMakeBorder(cv_cropped_img, cv_cropped_img, 0, pad_height,
+          0, pad_width, cv::BORDER_CONSTANT,
+          cv::Scalar(mean_values_[0], mean_values_[1], mean_values_[2]));
+    if(is_label_ml) {
+      const unsigned int my_ignore_label = 1 << 31;
+      const float* p_my_ignore_label = reinterpret_cast<const float*>(&my_ignore_label);
+      cv::copyMakeBorder(cv_cropped_seg, cv_cropped_seg, 0, pad_height,
+          0, pad_width, cv::BORDER_CONSTANT,
+          cv::Scalar::all(0));
+      float* ptr = (float*)cv_cropped_seg.data;
+      int offset = crop_width * label_channels;
+      for (int i = 0; i < crop_height; i++){
+          for (int j = 0; j < crop_width; j++){
+              if ((i >= img_height) || (j >= img_width)){
+                  ptr[offset*i + label_channels*j + (label_channels-1)] = *p_my_ignore_label;
+              }
+          }
+      }
+    }
+    else {
+      cv::copyMakeBorder(cv_cropped_seg, cv_cropped_seg, 0, pad_height,
+          0, pad_width, cv::BORDER_CONSTANT,
+          cv::Scalar(ignore_label));
+    }
+    //pad edge maps, if any
+    for(int ith=0; ith<num_edge_chn; ++ith) {
+      cv::copyMakeBorder(cv_cropped_edges[ith], cv_cropped_edges[ith], 0, pad_height,
+          0, pad_width, cv::BORDER_CONSTANT,
+          cv::Scalar(0));
+    }
+    // update height/width
+    img_height   = cv_cropped_img.rows;
+    img_width    = cv_cropped_img.cols;
+
+    seg_height   = cv_cropped_seg.rows;
+    seg_width    = cv_cropped_seg.cols;
+  }
+
+  // crop img/seg
+  if (crop_width && crop_height) {
+    CHECK_EQ(crop_height, data_height);
+    CHECK_EQ(crop_width, data_width);
+    // We only do random crop when we do training.
+    if (phase_ == TRAIN) {
+      h_off = Rand(img_height - crop_height + 1);
+      w_off = Rand(img_width - crop_width + 1);
+    } else {
+      // CHECK: use middle crop
+      h_off = (img_height - crop_height) / 2;
+      w_off = (img_width - crop_width) / 2;
+    }
+    cv::Rect roi(w_off, h_off, crop_width, crop_height);
+    cv_cropped_img = cv_cropped_img(roi);
+    cv_cropped_seg = cv_cropped_seg(roi);
+    //crop edge maps, if any
+    for(int ith=0; ith<num_edge_chn; ++ith) {
+      cv_cropped_edges[ith] = cv_cropped_edges[ith](roi);
+    }
+  }
+
+  CHECK(cv_cropped_img.data);
+  CHECK(cv_cropped_seg.data);
+
+  Dtype* transformed_data  = transformed_data_blob->mutable_cpu_data();
+  Dtype* transformed_label = transformed_label_blob->mutable_cpu_data();
+
+  int top_index;
+  const double* data_ptr = NULL;
+  const uchar* label_ptr = NULL;
+  const float* labelml_ptr = NULL;
+
+  for (int h = 0; h < data_height; ++h) {
+    data_ptr = cv_cropped_img.ptr<double>(h);
+    if(is_label_ml) {
+      labelml_ptr = cv_cropped_seg.ptr<float>(h);
+    } else {
+      label_ptr = cv_cropped_seg.ptr<uchar>(h);
+    }
+
+    int data_index = 0;
+    int label_index = 0;
+
+    for (int w = 0; w < data_width; ++w) {
+      // for image
+      for (int c = 0; c < img_channels; ++c) {
+        if (do_mirror) {
+          top_index = (c * data_height + h) * data_width + (data_width - 1 - w);
+        } else {
+          top_index = (c * data_height + h) * data_width + w;
+        }
+        Dtype pixel = static_cast<Dtype>(data_ptr[data_index++]);
+        if (has_mean_file) {
+          int mean_index = (c * img_height + h_off + h) * img_width + w_off + w;
+          transformed_data[top_index] =
+            (pixel - mean[mean_index]) * scale;
+        } else {
+          if (has_mean_values) {
+            transformed_data[top_index] =
+              (pixel - mean_values_[c]) * scale;
+          } else {
+            transformed_data[top_index] = pixel * scale;
+          }
+        }
+      }
+
+      // for segmentation
+      // for CASENet
+      for (int c = 0; c < label_channels; ++c) {
+          if (do_mirror) {
+              top_index = (c * data_height + h) * data_width + (data_width - 1 - w);
+          }
+          else {
+              top_index = (c * data_height + h) * data_width + w;
+          }
+          if (is_label_ml) {
+              Dtype pixel = static_cast<Dtype>(labelml_ptr[label_index++]);
+              transformed_label[top_index] = pixel;
+          }
+          else {
+              Dtype pixel = static_cast<Dtype>(label_ptr[label_index++]);
+              transformed_label[top_index] = pixel;
+          }
+      }
+    }
+  }
+
+  const float* edge_ptr;
+  // for edges, if any
+  for(int ith=0; ith<num_edge_chn; ++ith) { //edge map channel
+    const int top_offset = data_width * data_height * (img_channels + ith);
+    for (int h = 0; h < data_height; ++h) {
+      edge_ptr = cv_cropped_edges[ith].ptr<float>(h);
+      for (int w = 0; w < data_width; ++w) {
+        if (do_mirror) {
+          top_index = h * data_width + data_width - 1 - w + top_offset;
+        } else {
+          top_index = h * data_width + w + top_offset;
+        }
+        transformed_data[top_index] = static_cast<Dtype>(edge_ptr[w]) / 255.0;
+      }
+    }
   }
 }
 

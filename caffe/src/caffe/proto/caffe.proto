@@ -428,6 +428,13 @@ message TransformationParameter {
   optional bool force_color = 6 [default = false];
   // Force the decoded image to have 1 color channels.
   optional bool force_gray = 7 [default = false];
+  // If we want to do data augmentation, Scaling factor for randomly scaling input images
+  repeated float scale_factors = 8;
+  // the width for cropped region
+  optional uint32 crop_width = 9 [default = 0];
+  // the height for cropped region
+  optional uint32 crop_height = 10 [default = 0];
+
 }
 
 // Message that stores parameters shared by loss layers
@@ -798,6 +805,20 @@ message ImageDataParameter {
   optional uint32 new_width = 10 [default = 0];
   // Specify if the images are color or gray
   optional bool is_color = 11 [default = true];
+
+  // This is the value set for pixels or images where we don't know the label
+  optional int32 ignore_label = 15 [default = 255];
+  enum LabelType {
+    NONE = 0;
+    IMAGE = 1;
+    PIXEL = 2;
+    PIXELML = 3; //for CASENet
+  }
+  optional LabelType label_type = 16 [default = IMAGE];
+  optional uint32 num_label_chn = 17 [default = 1]; //num_label_chn := std::ceil(#classes/32.0)
+  optional uint32 num_edge_chn = 18 [default = 0];
+  optional string edge_file_prefix_format = 19;
+
   // DEPRECATED. See TransformationParameter. For data pre-processing, we can do
   // simple scaling and subtracting the data mean, if provided. Note that the
   // mean subtraction is always carried out before scaling.
